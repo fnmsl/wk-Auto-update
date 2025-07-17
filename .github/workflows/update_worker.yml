@@ -2,182 +2,87 @@ name: Auto Update _worker.js
 
 on:
   schedule:
-    - cron: '0 0 * * *'    # 每天00:00 UTC运行
+    - cron: '0 0 */3 * *' # 每隔3天执行一次
   workflow_dispatch:       # 允许手动触发
     inputs:
       release_type:
         description: '选择更新版本类型' # 选择更新版本类型
-        required: true
+        required: false
         default: 'release'
-        type: choice
-        options:
-          - 'release'
-          - 'prerelease'
 
 jobs:
-  update:
+  update-worker:
     runs-on: ubuntu-latest
 
-    concurrency:
-      group: auto-update-lock
-      cancel-in-progress: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-submodules: true
+
+      # 创建或更新 _worker.js
+      - name: Create or update _worker.js
+        run: |
+          if ! git check-ignore -q _worker.js; then
+              echo "Creating new _worker.js"
+              cat << EOF > .github/workflows/_worker.js
+# This is an auto-generated file by GitHub Actions Workflow
+# Do not modify this file manually!
+
+name: Auto Update _worker.js
+
+on:
+  schedule:
+    - cron: '0 0 */3 * *' # 每隔3天执行一次
+
+jobs:
+  update-worker:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout 仓库 # 检出仓库代码
-        uses: actions/checkout@v4
-
-      - name: 检查并初始化 update_type.txt # 检查并初始化 update_type.txt 文件
-        id: init_update_type_file
-        run: |
-          if [ ! -f "update_type.txt" ]; then
-            echo "1" > update_type.txt
-            echo "UPDATE_TYPE_FILE_CREATED=true" >> $GITHUB_ENV
-            echo "update_type.txt 文件不存在，已自动创建并设置为 '1' (正式版)。"
-          else
-            echo "update_type.txt 文件已存在。"
-          fi
-
-      - name: 获取最新 release 信息 # 获取最新发布版本信息
-        id: get_release
-        run: |
-          RELEASE_TYPE_INPUT="${{ github.event.inputs.release_type }}"
-          ACTUAL_RELEASE_TYPE=""
-
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            if [ -f "update_type.txt" ]; then
-              FILE_CONTENT=$(cat update_type.txt | tr -d '\n' | tr -d '\r')
-              if [ "$FILE_CONTENT" == "0" ]; then
-                ACTUAL_RELEASE_TYPE="prerelease"
-              else
-                ACTUAL_RELEASE_TYPE="release"
-              fi
-            else
-              ACTUAL_RELEASE_TYPE="release"
-            fi
-          else
-            ACTUAL_RELEASE_TYPE="$RELEASE_TYPE_INPUT"
-          fi
-
-          echo "当前选择的更新类型: $ACTUAL_RELEASE_TYPE"
-
-          if [ "$ACTUAL_RELEASE_TYPE" == "prerelease" ]; then
-            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases | jq -r 'map(select(.prerelease == true and .draft == false)) | sort_by(.published_at) | .[-1].tag_name')
-            if [ -z "$latest_tag" ]; then
-              echo "未找到任何预发布版本。"
-              exit 1
-            fi
-            echo "最新预发布版本: $latest_tag"
-          else
-            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r '.tag_name')
-            if [ -z "$latest_tag" ]; then
-              echo "未找到任何正式发布版本。"
-              exit 1
-            fi
-            echo "最新正式发布版本: $latest_tag"
-          fi
-
-          echo "latest_tag=$latest_tag" >> $GITHUB_ENV
-          echo "release_type=$ACTUAL_RELEASE_TYPE" >> $GITHUB_ENV
-
-      - name: 检查本地 version.txt # 检查本地 version.txt 文件
-        id: check_version
-        run: |
-          if [ -f "version.txt" ]; then
-            current_version=$(cat version.txt | tr -d '\n' | tr -d '\r')
-            echo "当前本地版本: $current_version"
-          else
-            echo "未找到 version.txt，视为首次更新。"
-            current_version=""
-          fi
-          echo "current_version=$current_version" >> $GITHUB_ENV
-
-      - name: 判断是否需要更新 # 判断是否需要更新
-        id: need_update
-        run: |
-          if [ "$current_version" = "$latest_tag" ]; then
-            echo "No update needed."
-            echo "need_update=false" >> $GITHUB_ENV
-          else
-            echo "Update needed."
-            echo "need_update=true" >> $GITHUB_ENV
-
-      - name: 下载并替换 _worker.js # 下载并替换 _worker.js 文件
-        if: env.need_update == 'true'
-        run: |
-          download_url="https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ env.latest_tag }}/worker.js"
-          echo "下载文件: $download_url"
-          curl -L -o _worker.js "$download_url"
-          echo "${{ env.latest_tag }}" > version.txt
-
-      - name: 提交更新到 GitHub # 提交更新到 GitHub 仓库
-        if: env.need_update == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin $(git rev-parse --abbrev-ref HEAD) || true
-          git add _worker.js version.txt
-          git commit -m "Update _worker.js to version ${{ env.latest_tag }}" || echo "没有需要提交的更改。"
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" || {
-            echo "🚨 git push 失败，请检查是否有冲突或权限问题。"
-            git status
-            git log -3
-            exit 128
-          }
-
-      - name: 提交 update_type.txt (如果自动创建) # 提交 update_type.txt (如果文件是自动创建的)
-        if: env.UPDATE_TYPE_FILE_CREATED == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin $(git rev-parse --abbrev-ref HEAD) || true
-          git add update_type.txt
-          git commit -m "feat: Auto-created update_type.txt with default 'release' type" || echo "没有需要提交的更改。"
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" || {
-            echo "🚨 git push 失败，请检查是否有冲突或权限问题。"
-            git status
-            git log -3
-            exit 128
-          }
-
-      - name: 发送更新成功通知 (复用或创建 GitHub Issue) # 发送更新成功通知 (复用或创建 GitHub Issue)
-        if: success() && env.need_update == 'true'
-        uses: actions/github-script@v6
+      - name: Checkout repository
+        uses: actions/checkout@v2
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const latestTag = process.env.latest_tag;
-            const releaseType = process.env.release_type;
-            const typeText = releaseType === 'prerelease' ? '预发布版本' : '正式版本';
-            const notificationTitle = `_worker.js 自动更新通知`;
-            const notificationBody = `_worker.js 已成功更新到${typeText} ${latestTag}。`;
-            const timestamp = new Date().toLocaleString('zh-CN');
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner,
-              repo,
-              state: 'open',
-              labels: 'auto-update-status-issue',
-              per_page: 1
-            });
-            let targetIssue = null;
-            if (issues.length > 0) {
-              targetIssue = issues[0];
-            }
-            if (targetIssue) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: targetIssue.number,
-                body: `${notificationBody}\n\n更新时间: ${timestamp}`
-              });
-              console.log(`已在现有 Issue #${targetIssue.number} 上添加评论。`);
-            } else {
-              const { data: newIssue } = await github.rest.issues.create({
-                owner,
-                repo,
-                title: notificationTitle,
-                body: `${notificationBody}\n\n更新时间: ${timestamp}`,
-                labels: ['auto-update', 'success', 'auto-update-status-issue']
-              });
-              console.log(`已创建新的 Issue #${newIssue.number}。`);
-            }
+          fetch-submodules: true
+
+      # 其他步骤如同之前的工作流程...
+            EOF
+            git add .github/workflows/_worker.js
+            git commit -m "Update _worker.js on $(date)"
+            git push origin main
+          else
+              echo "Updating _worker.js"
+              cat << EOF > .github/workflows/_worker.js
+# This is an auto-generated file by GitHub Actions Workflow
+# Do not modify this file manually!
+
+name: Auto Update _worker.js
+
+on:
+  schedule:
+    - cron: '0 0 */3 * *' # 每隔3天执行一次
+
+jobs:
+  update-worker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-submodules: true
+
+      # 其他步骤如同之前的工作流程...
+            EOF
+            git add .github/workflows/_worker.js
+            git commit -m "Update _worker.js on $(date)"
+            git push origin main
+          fi
+
+      # 创建或更新 version.txt
+      - name: Create or update version.txt
+        run: echo "$(git rev-parse HEAD)" > version.txt
+
+      # 发送通知
+      - name: Send update success notification (reuse or create GitHub Issue)
+        uses: actions/github-script@v6
