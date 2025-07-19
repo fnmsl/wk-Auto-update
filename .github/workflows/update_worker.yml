@@ -2,7 +2,7 @@ name: Auto Update _worker.js
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *'  # 每天定时执行
   workflow_dispatch:
     inputs:
       release_type:
@@ -35,7 +35,7 @@ jobs:
             echo "UPDATE_TYPE_FILE_CREATED=true" >> $GITHUB_ENV
           fi
 
-      - name: 获取最新版本号
+      - name: 获取最新版本号并判断是否更新
         id: check_update
         run: |
           RELEASE_TYPE="${{ github.event.inputs.release_type }}"
@@ -47,9 +47,9 @@ jobs:
           echo "release_type=$RELEASE_TYPE" >> $GITHUB_ENV
 
           if [ "$RELEASE_TYPE" = "prerelease" ]; then
-            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases | jq -r 'map(select(.prerelease and .draft == false)) | sort_by(.published_at) | .[-1].tag_name')
+            latest_tag=$(curl -s --retry 3 --retry-delay 2 https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases | jq -r 'map(select(.prerelease and .draft == false)) | sort_by(.published_at) | .[-1].tag_name')
           else
-            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r '.tag_name')
+            latest_tag=$(curl -s --retry 3 --retry-delay 2 https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r '.tag_name')
           fi
           echo "latest_tag=$latest_tag" >> $GITHUB_ENV
           echo "::set-output name=latest_tag::$latest_tag"
@@ -68,11 +68,10 @@ jobs:
       - name: 跳过更新提示
         if: env.need_update == 'false'
         run: echo "✅ 当前版本已是最新，无需更新。"
-
       - name: 下载新版 _worker.js
         if: env.need_update == 'true'
         run: |
-          curl -L -o _worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ env.latest_tag }}/worker.js"
+          curl --retry 3 --retry-delay 2 -L -o _worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ env.latest_tag }}/worker.js"
 
       - name: 写入标记文件
         if: env.need_update == 'true'
@@ -114,12 +113,11 @@ jobs:
             git commit -m "chore: 创建或重置 update_type.txt 为正式版"
             git push
           fi
-
       - name: 发布 Git Tag 和 Release
         if: env.need_update == 'true'
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_PAT }}
           script: |
             const { owner, repo } = context.repo;
             const tag = process.env.latest_tag;
@@ -137,7 +135,7 @@ jobs:
         if: env.need_update == 'true'
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_PAT }}
           script: |
             const { owner, repo } = context.repo;
             const tag = process.env.latest_tag;
@@ -177,7 +175,7 @@ jobs:
       - name: 部署 _worker.js 到页面
         run: |
           mkdir -p js
-          curl -L -o ./js/_worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ needs.update.outputs.latest_tag }}/worker.js"
+          curl --retry 3 --retry-delay 2 -L -o ./js/_worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ needs.update.outputs.latest_tag }}/worker.js"
           echo "<!DOCTYPE html><html><body><script src='js/_worker.js'></script></body></html>" > index.html
 
       - name: 推送到 gh-pages 分支
@@ -185,5 +183,11 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "chore: 部署 _worker.js 到 GitHub Pages"
-          git push origin gh-pages
+          if git diff --cached --quiet; then
+            echo "📄 页面内容无变化，跳过提交。"
+          else
+            git commit -m "chore: 部署 _worker.js 到 GitHub Pages"
+            git push origin gh-pages
+- name: 收尾标记（强制成功）
+  if: always()
+  run: echo "🎉 自动更新流程已完整执行。"
