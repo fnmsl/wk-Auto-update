@@ -2,7 +2,7 @@ name: Auto Update _worker.js
 
 on:
   schedule:
-    - cron: '0 0 * * *'    # 每天 00:00 UTC 运行
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       release_type:
@@ -13,11 +13,17 @@ on:
         options:
           - 'release'
           - 'prerelease'
+
 jobs:
   update:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 为 GITHUB_TOKEN 提供写入权限，增强兼容性
+      contents: write
+
+    outputs:
+      need_update: ${{ steps.check_update.outputs.need_update }}
+      latest_tag: ${{ steps.check_update.outputs.latest_tag }}
+
     steps:
       - name: Checkout 仓库
         uses: actions/checkout@v4
@@ -28,46 +34,66 @@ jobs:
             echo "1" > update_type.txt
             echo "UPDATE_TYPE_FILE_CREATED=true" >> $GITHUB_ENV
           fi
-      - name: 检查本地 version.txt
+
+      - name: 获取最新版本号
+        id: check_update
         run: |
+          RELEASE_TYPE="${{ github.event.inputs.release_type }}"
+          EVENT_NAME="${{ github.event_name }}"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            FILE_CONTENT=$(cat update_type.txt 2>/dev/null | tr -d '\n\r')
+            RELEASE_TYPE=$([[ "$FILE_CONTENT" = "0" ]] && echo "prerelease" || echo "release")
+          fi
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_ENV
+
+          if [ "$RELEASE_TYPE" = "prerelease" ]; then
+            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases | jq -r 'map(select(.prerelease and .draft == false)) | sort_by(.published_at) | .[-1].tag_name')
+          else
+            latest_tag=$(curl -s https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest | jq -r '.tag_name')
+          fi
+          echo "latest_tag=$latest_tag" >> $GITHUB_ENV
+          echo "::set-output name=latest_tag::$latest_tag"
+
           current_version=$(cat version.txt 2>/dev/null | tr -d '\n\r')
           echo "current_version=$current_version" >> $GITHUB_ENV
 
-      - name: 判断是否需要更新
-        run: |
-          if [ "$current_version" = "$latest_tag" ]; then
+          if [ "$latest_tag" = "$current_version" ]; then
             echo "need_update=false" >> $GITHUB_ENV
+            echo "::set-output name=need_update::false"
           else
             echo "need_update=true" >> $GITHUB_ENV
+            echo "::set-output name=need_update::true"
           fi
 
       - name: 跳过更新提示
         if: env.need_update == 'false'
-        run: echo "✅ 当前版本已是最新，无需更新 _worker.js。"
+        run: echo "✅ 当前版本已是最新，无需更新。"
+
       - name: 下载新版 _worker.js
         if: env.need_update == 'true'
         run: |
           curl -L -o _worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ env.latest_tag }}/worker.js"
 
-      - name: 写入版本 + 时间戳 + 哈希标记
+      - name: 写入标记文件
         if: env.need_update == 'true'
         run: |
           echo "${{ env.latest_tag }}" > version.txt
           echo "$(date +%s)" > update_timestamp.txt
           echo "${{ env.latest_tag }}" | sha256sum > update_hash.txt
+          echo "- $(date '+%Y-%m-%d %H:%M') 更新到版本 ${{ env.latest_tag }}（类型：${{ env.release_type }}）" >> update_log.md
           touch .update-marker
-      - name: 提交所有更新文件
+
+      - name: 提交更新文件
         if: env.need_update == 'true'
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}
-
-          git add _worker.js version.txt update_timestamp.txt update_hash.txt .update-marker
+          git add _worker.js version.txt update_timestamp.txt update_hash.txt update_log.md .update-marker
           if git diff --cached --quiet; then
-            echo "📄 没有变更文件可提交，跳过提交步骤。"
+            echo "📄 没有变更文件可提交，跳过提交。"
           else
-            git commit -m "chore: 更新 _worker.js 到正式版本 ${{ env.latest_tag }}"
+            git commit -m "chore: 更新 _worker.js 到版本 ${{ env.latest_tag }}"
             git push origin main
           fi
 
@@ -75,8 +101,40 @@ jobs:
         if: env.need_update == 'true'
         run: rm -f .update-marker
 
-      - name: 创建或更新 Issue 通知
-        if: success() && env.need_update == 'true'
+      - name: 提交新建或重置的 update_type.txt
+        if: env.UPDATE_TYPE_FILE_CREATED == 'true' || env.need_update == 'true'
+        run: |
+          echo "1" > update_type.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add update_type.txt
+          if git diff --cached --quiet; then
+            echo "📄 update_type.txt 没有变更，跳过提交。"
+          else
+            git commit -m "chore: 创建或重置 update_type.txt 为正式版"
+            git push
+          fi
+
+      - name: 发布 Git Tag 和 Release
+        if: env.need_update == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.latest_tag;
+            const type = process.env.release_type === "prerelease" ? "预发布版本" : "正式版本";
+            const body = `自动发布：_worker.js 更新到 ${type} ${tag}\n\n更新时间: ${new Date().toLocaleString('zh-CN')}`;
+            await github.rest.repos.createRelease({
+              owner, repo,
+              tag_name: tag,
+              name: `版本 ${tag}`,
+              body,
+              prerelease: process.env.release_type === "prerelease"
+            });
+
+      - name: 创建或更新通知 Issue
+        if: env.need_update == 'true'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -86,43 +144,46 @@ jobs:
             const type = process.env.release_type === "prerelease" ? "预发布版本" : "正式版本";
             const title = `_worker.js 自动更新通知（${type}）`;
             const body = `_worker.js 已成功更新到${type} **${tag}**。\n\n🕒 更新时间: ${new Date().toLocaleString('zh-CN')}`;
-
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', labels: 'auto-update-status-issue'
             });
-
             if (issues.length > 0) {
-              const comments = await github.rest.issues.listComments({
-                owner, repo, issue_number: issues[0].number
-              });
+              const comments = await github.rest.issues.listComments({ owner, repo, issue_number: issues[0].number });
               const exists = comments.data.some(c => c.body.includes(tag));
               if (!exists) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: issues[0].number, body
-                });
+                await github.rest.issues.createComment({ owner, repo, issue_number: issues[0].number, body });
               }
             } else {
               await github.rest.issues.create({
-                owner, repo,
-                title, body,
+                owner, repo, title, body,
                 labels: ['auto-update', 'success', 'auto-update-status-issue']
               });
             }
-      - name: 提交新建的 update_type.txt（如有）
-        if: env.UPDATE_TYPE_FILE_CREATED == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add update_type.txt
-          git commit -m "chore: 自动创建 update_type.txt 默认 release 类型"
-          git push
 
-      - name: 重置 update_type.txt 为正式版本
-        if: env.need_update == 'true'
+  deploy_pages:
+    needs: update
+    runs-on: ubuntu-latest
+    if: needs.update.outputs.need_update == 'true'
+
+    steps:
+      - name: Checkout gh-pages 分支
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - name: 清空旧文件
+        run: rm -rf ./*
+
+      - name: 部署 _worker.js 到页面
         run: |
-          echo "1" > update_type.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add update_type.txt
-          git commit -m "chore: 重置 update_type.txt 为正式版本"
-          git push
+          mkdir -p js
+          curl -L -o ./js/_worker.js "https://github.com/bia-pain-bache/BPB-Worker-Panel/releases/download/${{ needs.update.outputs.latest_tag }}/worker.js"
+          echo "<!DOCTYPE html><html><body><script src='js/_worker.js'></script></body></html>" > index.html
+
+      - name: 推送到 gh-pages 分支
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: 部署 _worker.js 到 GitHub Pages"
+          git push origin gh-pages
